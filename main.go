@@ -328,6 +328,7 @@ func parseTransactionsFromCSV(in []byte) []Txn {
 
 	result := make([]Txn, 0, 100)
 	r := csv.NewReader(bytes.NewReader(in))
+	r.LazyQuotes = true
 	var t Txn
 	var skipped int
 	for {
