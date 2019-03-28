@@ -12,6 +12,8 @@ import (
 	"time"
 
 	yaml "gopkg.in/yaml.v2"
+
+	"github.com/plaid/plaid-go/plaid"
 )
 
 var (
@@ -59,9 +61,11 @@ type PlaidOptions struct {
 }
 
 type PlaidRequest struct {
-	Secret      string            `json:"secret" yaml:"secret"`
-	ClientId    string            `json:"client_id" yaml:"client_id"`
+	Secret      string            `json:"secret" yaml:"PLAID_SECRET"`
+	ClientId    string            `json:"client_id" yaml:"PLAID_CLIENT_ID"`
 	AccessToken string            `json:"access_token" yaml:"access_token"`
+	PublicKey   string            `json:"public_key" yaml:"PLAID_PUBLIC_KEY"`
+	Env         string            `json:"env" yaml:"PLAID_ENV"`
 	Accounts    map[string]string `json:"-" yaml:"accounts"`
 	StartDate   string            `json:"start_date"`
 	EndDate     string            `json:"end_date"`
@@ -224,6 +228,28 @@ func newPlaidRequest(account string) (*PlaidRequest, error) {
 	preq.StartDate = *plaidSince
 	preq.EndDate = *plaidTo
 
+	clientOptions := plaid.ClientOptions {
+		ClientID: preq.ClientId,
+		Secret: preq.Secret,
+		PublicKey: preq.PublicKey,
+		Environment: plaid.Development,
+		HTTPClient: &http.Client{},
+	}
+
+	client, err := plaid.NewClient(clientOptions)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// POST /institutions/get
+	instsResp, err := client.GetInstitutions(5, 0)
+	if err != nil {
+		fmt.Print(err)
+		return nil, err
+	}
+	fmt.Println(instsResp.Institutions[0].Name, "has products:", instsResp.Institutions[0].Products)
+	
 	var accountId string
 	for short, id := range preq.Accounts {
 		if account == short {

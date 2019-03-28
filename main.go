@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,8 @@ import (
 	"github.com/jbrukh/bayesian"
 	"github.com/manishrjain/keys"
 	"github.com/pkg/errors"
+	"github.com/abourget/ledger/parse"
+
 )
 
 var (
@@ -35,8 +38,10 @@ var (
 	journal    = flag.String("j", "", "Existing journal to learn from.")
 	output     = flag.String("o", "out.ldg", "Journal file to write to.")
 	csvFile    = flag.String("csv", "", "File path of CSV file containing new transactions.")
+	lgdFile    = flag.String("lgd", "", "File path of ledger containing new transactions.")
 	account    = flag.String("a", "", "Name of bank account transactions belong to.")
 	currency   = flag.String("c", "", "Set currency if any.")
+	ignoreZeroCurrency   = flag.Bool("ignoreZeroCurrency", false, "Ignore rows of zero currence.")
 	ignore     = flag.String("ic", "", "Comma separated list of columns to ignore in CSV.")
 	dateFormat = flag.String("d", "01/02/2006",
 		"Express your date format in numeric form w.r.t. Jan 02, 2006, separated by slashes (/). See: https://golang.org/pkg/time/")
@@ -90,6 +95,8 @@ type Txn struct {
 	Key                []byte
 	skipClassification bool
 	Done               bool
+	Code               string
+	Metadata           string
 }
 
 type byTime []Txn
@@ -100,8 +107,10 @@ func (b byTime) Swap(i int, j int)      { b[i], b[j] = b[j], b[i] }
 
 func checkf(err error, format string, args ...interface{}) {
 	if err != nil {
+		log.Println(os.Stderr)
 		log.Printf(format, args)
 		log.Println()
+		log.Println(err)
 		log.Fatalf("%+v", errors.WithStack(err))
 	}
 }
@@ -128,6 +137,15 @@ func assignForAccount(account string) {
 	}
 }
 
+type ledger struct {
+	db       *bolt.DB
+	data     []byte
+	txns     []Txn
+	classes  []bayesian.Class
+	cl       *bayesian.Classifier
+	accounts []string
+	tree     *parse.Tree
+}
 type parser struct {
 	db       *bolt.DB
 	data     []byte
@@ -149,6 +167,9 @@ func (p *parser) parseTransactions() {
 		}
 		checkf(err, "Unable to read a csv line.")
 
+		if *debug {
+			fmt.Printf("%v\n", cols)
+		}
 		t = Txn{}
 		t.Date, err = time.Parse(stamp, cols[0])
 		checkf(err, "Unable to parse time: %v", cols[0])
@@ -363,7 +384,14 @@ func parseTransactionsFromCSV(in []byte) []Txn {
 			}
 		}
 
-		if len(t.Desc) != 0 && !t.Date.IsZero() && t.Cur != 0.0 {
+		if (t.Cur == 0.0 && *ignoreZeroCurrency) {
+			if *debug {
+				fmt.Printf("Selected CSV    : %v\n", strings.Join(picked, ", "))
+				fmt.Printf("Parsed Date     : %v\n", t.Date)
+				fmt.Printf("Parsed Desc     : %v\n", t.Desc)
+				fmt.Printf("Parsed Currency : %v\n", t.Cur)
+			}
+		} else if len(t.Desc) != 0 && !t.Date.IsZero() && t.Cur != 0.0 {
 			y, m, d := t.Date.Year(), t.Date.Month(), t.Date.Day()
 			t.Date = time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 			result = append(result, t)
@@ -418,14 +446,38 @@ func (b byVal) Swap(i int, j int) {
 }
 
 func singleCharMode() {
-	// disable input buffering
-	exec.Command("stty", "-F", "/dev/tty", "cbreak", "min", "1").Run()
-	// do not display entered characters on the screen
-	exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
+
+	if runtime.GOOS == "darwin" {
+
+		// disable input buffering
+		cmd := exec.Command("stty", "-f", "/dev/tty", "cbreak", "min", "1", "-icanon")
+
+		var out bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		if err != nil {
+			fmt.Printf("stdout: %q\n", out.String())
+			fmt.Printf("stderr: %q\n", stderr.String())
+			log.Println(err)
+		}
+		// do not display entered characters on the screen
+		exec.Command("stty", "-f", "/dev/tty", "-echo").Run()
+	} else {
+		// disable input buffering
+		exec.Command("stty", "-F", "/dev/tty", "cbreak", "min", "1").Run()
+		// do not display entered characters on the screen
+		exec.Command("stty", "-F", "/dev/tty", "-echo").Run()
+	}
 }
 
 func saneMode() {
-	exec.Command("stty", "-F", "/dev/tty", "sane").Run()
+	if runtime.GOOS == "darwin" {
+		exec.Command("stty", "-f", "/dev/tty", "sane").Run()
+	} else {
+		exec.Command("stty", "-F", "/dev/tty", "sane").Run()
+	}
 }
 
 func getCategory(t Txn) (prefix, cat string) {
@@ -689,9 +741,18 @@ func (p *parser) showAndCategorizeTxns(rtxns []Txn) {
 
 func ledgerFormat(t Txn) string {
 	var b bytes.Buffer
-	b.WriteString(fmt.Sprintf("%s\t%s\n", t.Date.Format(stamp), t.Desc))
+	code := ""
+	if len(t.Code) > 0 {
+		code = fmt.Sprintf(" (%s) ", t.Code)
+	}
+
+	b.WriteString(fmt.Sprintf("%s\t%s%s\n", t.Date.Format(stamp), code, t.Desc))
 	b.WriteString(fmt.Sprintf("\t%-20s\t%.2f%s\n", t.To, math.Abs(t.Cur), t.CurName))
+	if len(t.Metadata) > 0 {
+		b.WriteString(fmt.Sprintf("\t;%s\n", t.Metadata))
+	}
 	b.WriteString(fmt.Sprintf("\t%s\n\n", t.From))
+
 	return b.String()
 }
 
@@ -854,6 +915,7 @@ func oerr(msg string) {
 }
 
 func main() {
+	fmt.Println(os.Getenv("GOOS"))
 	flag.Parse()
 
 	if *plaidHist != "" {
@@ -943,8 +1005,41 @@ func main() {
 		checkf(err, "Unable to read csv file: %v", *csvFile)
 		txns = parseTransactionsFromCSV(in)
 
+	case len(*lgdFile) > 0:
+		if _, err := os.Stat(*lgdFile); os.IsNotExist(err) {
+			checkf(err, "ldgFile doesn't exist.  %s ", *lgdFile)
+		}
+		cnt, err := ioutil.ReadFile(*lgdFile)
+		if err != nil {
+			log.Fatalln("Error reading input:", err)
+		}
+		
+		tree := parse.New(*lgdFile, string(cnt))
+		err = tree.Parse()
+		if err != nil {
+			log.Fatalln("Parsing error:", err)
+		}
+
+		for _, nodeIface := range tree.Root.Nodes {
+			switch node := nodeIface.(type) {
+			case *parse.XactNode:
+				fmt.Println(node)
+			case *parse.CommentNode:
+
+			case *parse.SpaceNode:
+
+			default:
+				fmt.Printf("unprintable node type %T\n", nodeIface)
+			}
+		}		
+
+
 	default:
-		assertf(false, "Please specify either a CSV flag or a Plaid flag")
+		// in, err := bufio.NewReader(os.Stdin).ReadBytes()
+		// checkf(err, "Error reading  csv from stdin.")
+		// txns = parseTransactionsFromCSV(in)
+
+		assertf(false, "Please specify a LGD,  a CSV, or a Plaid flag")
 	}
 
 	for i := range txns {
@@ -959,10 +1054,15 @@ func main() {
 		fmt.Println("Earliest and Latest transactions:")
 		printSummary(txns[0], 1, 2)
 		printSummary(txns[len(txns)-1], 2, 2)
-		fmt.Println()
+		fmt.Println("")
 	}
-
+	if *debug {
+		fmt.Printf("txns base %v\n", len(txns))
+	}
 	txns = p.removeDuplicates(txns) // sorts by date.
+	if *debug {
+		fmt.Printf("txns -dup %v\n", len(txns))
+	}
 
 	// Now sort by description for the rest of the categorizers.
 	sort.Slice(txns, func(i, j int) bool {
@@ -975,13 +1075,23 @@ func main() {
 		return txns[i].Date.After(txns[j].Date)
 	})
 	txns = p.categorizeByRules(txns)
+	if *debug {
+		fmt.Printf("txns rule %v\n", len(txns))
+	}
 	txns = p.categorizeBelow(txns)
+	if *debug {
+		fmt.Printf("txns belw %v\n", len(txns))
+	}
 	p.showAndCategorizeTxns(txns)
 
 	final := p.iterateDB()
+	if *debug {
+		fmt.Printf("txns finl %v\n", len(final))
+	}
 	sort.Sort(byTime(final))
 
-	_, err = of.WriteString(fmt.Sprintf("; into-ledger run at %v\n\n", time.Now()))
+	_, err = of.WriteString(fmt.Sprintf("; into-ledger run at %v. %v records\n\n", time.Now(), len(final)))
+
 	checkf(err, "Unable to write into output file: %v", of.Name())
 
 	for _, t := range final {
